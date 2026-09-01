@@ -1,0 +1,14 @@
+[package]
+name = "worktree-explorer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["env", "derive"] }
+crossterm = "0.29.0"
+gix = { version = "0.87.1", default-features = false, features = ["revision", "status", "max-performance-safe", "sha1"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
