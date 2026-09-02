@@ -12,10 +12,14 @@ struct Args {
     /// A repository or a directory contained by one
     #[arg(default_value = ".")]
     directory: PathBuf,
+
+    /// Also scan immediate child directories for Git repositories
+    #[arg(long)]
+    recursive: bool,
 }
 
 pub fn run() -> Result<()> {
     let args = Args::parse();
-    let repository = git::RepositoryManager::discover(&args.directory)?;
-    tui::run(repository)
+    let repositories = git::discover_repositories(&args.directory, args.recursive)?;
+    tui::run(repositories, args.recursive)
 }

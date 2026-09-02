@@ -24,11 +24,11 @@ use crate::git::{
     WorktreeKey, WorktreeStatus,
 };
 
-pub fn run(repository: RepositoryManager) -> Result<()> {
+pub fn run(repositories: Vec<RepositoryManager>, recursive: bool) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .context("failed to initialize the terminal")?;
-    let mut app = App::new(repository)?;
+    let mut app = App::new(repositories, recursive)?;
 
     loop {
         terminal
@@ -82,6 +82,7 @@ enum View {
         offset: usize,
     },
     ConfirmDelete {
+        repository_index: usize,
         worktree: WorktreeInfo,
         assessment: DeletionAssessment,
         phase: ConfirmationPhase,
@@ -89,28 +90,56 @@ enum View {
     },
 }
 
-struct App {
+struct RepositoryGroup {
     repository: RepositoryManager,
     worktrees: Vec<WorktreeInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TreeIdentity {
+    Repository(std::path::PathBuf),
+    Worktree(std::path::PathBuf, WorktreeKey),
+}
+
+struct App {
+    repositories: Vec<RepositoryGroup>,
     selected: usize,
     view: View,
     message: Option<String>,
+    recursive: bool,
+    hide_without_linked: bool,
+    page_size: usize,
 }
 
 impl App {
-    fn new(repository: RepositoryManager) -> Result<Self> {
-        let worktrees = repository.list_worktrees()?;
+    fn new(repositories: Vec<RepositoryManager>, recursive: bool) -> Result<Self> {
+        let repositories = repositories
+            .into_iter()
+            .map(|repository| {
+                let worktrees = repository.list_worktrees()?;
+                Ok(RepositoryGroup {
+                    repository,
+                    worktrees,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected = repositories
+            .first()
+            .is_some_and(|group| !group.worktrees.is_empty()) as usize;
         Ok(Self {
-            repository,
-            worktrees,
-            selected: 0,
+            repositories,
+            selected,
             view: View::Worktrees,
             message: None,
+            recursive,
+            hide_without_linked: false,
+            page_size: 1,
         })
     }
 
-    fn render(&self, frame: &mut Frame<'_>) {
+    fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        self.page_size = usize::from(area.height.saturating_sub(4)).max(1);
         match &self.view {
             View::Worktrees => self.render_worktrees(frame, area),
             View::Log {
@@ -124,6 +153,7 @@ impl App {
                 offset,
             } => self.render_status(frame, area, worktree, status, *offset),
             View::ConfirmDelete {
+                repository_index: _,
                 worktree,
                 assessment,
                 phase,
@@ -140,61 +170,100 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(2)])
             .split(area);
-        let items = self.worktrees.iter().enumerate().map(|(index, worktree)| {
-            let mut markers = Vec::new();
-            if matches!(worktree.key, WorktreeKey::Main) {
-                markers.push("main");
-            }
-            if worktree.locked {
-                markers.push("locked");
-            }
-            if !worktree.available {
-                markers.push("missing");
-            }
-            let marker = if markers.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", markers.join(", "))
-            };
-            let head = worktree.head.as_deref().unwrap_or("--------");
-            let age = worktree
-                .committed_at
-                .map(relative_age)
-                .unwrap_or_else(|| "—".to_owned());
-            let metadata_style = Style::default().fg(if index == self.selected {
-                Color::White
-            } else {
-                Color::DarkGray
-            });
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{head:<8} "), metadata_style),
-                Span::styled(format!("{age:<10} "), metadata_style),
+        let mut items = Vec::new();
+        for group in self
+            .repositories
+            .iter()
+            .filter(|group| self.group_is_visible(group))
+        {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("▾ ", Style::default().fg(Color::Magenta)),
                 Span::styled(
-                    format!("{:<20} ", worktree.reference_label()),
-                    Style::default().fg(Color::Cyan),
+                    group.repository.root().display().to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(worktree.path.display().to_string()),
-                Span::styled(marker, Style::default().fg(Color::Yellow)),
-            ]))
-        });
+            ])));
+            let last_index = group.worktrees.len().saturating_sub(1);
+            for (worktree_index, worktree) in group.worktrees.iter().enumerate() {
+                let row_index = items.len();
+                let mut markers = Vec::new();
+                if matches!(worktree.key, WorktreeKey::Main) {
+                    markers.push("main");
+                }
+                if worktree.locked {
+                    markers.push("locked");
+                }
+                if !worktree.available {
+                    markers.push("missing");
+                }
+                let marker = if markers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", markers.join(", "))
+                };
+                let head = worktree.head.as_deref().unwrap_or("--------");
+                let age = worktree
+                    .committed_at
+                    .map(relative_age)
+                    .unwrap_or_else(|| "—".to_owned());
+                let metadata_style = Style::default().fg(if row_index == self.selected {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                });
+                let connector = if worktree_index == last_index {
+                    "  └─ "
+                } else {
+                    "  ├─ "
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(connector, Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{head:<8} "), metadata_style),
+                    Span::styled(format!("{age:<10} "), metadata_style),
+                    Span::styled(
+                        format!("{:<20} ", worktree.reference_label()),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(worktree.path.display().to_string()),
+                    Span::styled(marker, Style::default().fg(Color::Yellow)),
+                ])));
+            }
+        }
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Worktrees "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Repositories and worktrees "),
+            )
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("› ");
-        let selected = if self.worktrees.is_empty() {
+        let selected = if self.row_count() == 0 {
             None
         } else {
-            Some(self.selected.min(self.worktrees.len() - 1))
+            Some(self.selected.min(self.row_count() - 1))
         };
         let mut state = ListState::default().with_selected(selected);
         frame.render_stateful_widget(list, chunks[0], &mut state);
 
         let help = self.message.as_deref().map_or_else(
-            || "↑/↓ or j/k select   l logs   s status   d delete   r refresh   q quit".to_owned(),
+            || {
+                let filter_help = if self.recursive {
+                    if self.hide_without_linked {
+                        "   h show all"
+                    } else {
+                        "   h hide without linked"
+                    }
+                } else {
+                    ""
+                };
+                format!(
+                    "↑/↓ or j/k select   PgUp/PgDn page   l logs   s status   d delete   r refresh{filter_help}   q quit"
+                )
+            },
             |message| format!("Error: {message}"),
         );
         let style = if self.message.is_some() {
@@ -391,19 +460,25 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
         }
+        let page_size = self.page_size;
         match &mut self.view {
             View::Worktrees => self.handle_worktree_key(key),
             View::Log {
                 entries, offset, ..
             } => {
-                handle_scroll_key(key, offset, entries.len());
+                handle_scroll_key(key, offset, entries.len(), page_size);
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.view = View::Worktrees;
                 }
                 Ok(false)
             }
             View::Status { status, offset, .. } => {
-                handle_scroll_key(key, offset, status.entries.len().saturating_add(1));
+                handle_scroll_key(
+                    key,
+                    offset,
+                    status.entries.len().saturating_add(1),
+                    page_size,
+                );
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.view = View::Worktrees;
                 }
@@ -417,9 +492,14 @@ impl App {
             } => {
                 if matches!(
                     key.code,
-                    KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Char('j')
+                        | KeyCode::Char('k')
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
                 ) {
-                    handle_scroll_key(key, offset, assessment.changes.len());
+                    handle_scroll_key(key, offset, assessment.changes.len(), page_size);
                     return Ok(false);
                 }
                 match phase {
@@ -438,14 +518,27 @@ impl App {
                 self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.worktrees.len() {
+                if self.selected + 1 < self.row_count() {
                     self.selected += 1;
                 }
             }
+            KeyCode::PageUp => {
+                self.selected = self.selected.saturating_sub(self.page_size);
+            }
+            KeyCode::PageDown => {
+                self.selected = self
+                    .selected
+                    .saturating_add(self.page_size)
+                    .min(self.row_count().saturating_sub(1));
+            }
+            KeyCode::Char('h') if self.recursive => self.toggle_hide_without_linked(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('l') => {
-                if let Some(worktree) = self.selected_worktree().cloned() {
-                    match self.repository.log(&worktree.key) {
+                if let Some((repository_index, worktree)) = self.selected_worktree() {
+                    match self.repositories[repository_index]
+                        .repository
+                        .log(&worktree.key)
+                    {
                         Ok(entries) => {
                             self.view = View::Log {
                                 worktree,
@@ -455,11 +548,16 @@ impl App {
                         }
                         Err(error) => self.message = Some(format!("{error:#}")),
                     }
+                } else {
+                    self.message = Some("select a worktree, not a repository".to_owned());
                 }
             }
             KeyCode::Char('s') => {
-                if let Some(worktree) = self.selected_worktree().cloned() {
-                    match self.repository.status(&worktree.key) {
+                if let Some((repository_index, worktree)) = self.selected_worktree() {
+                    match self.repositories[repository_index]
+                        .repository
+                        .status(&worktree.key)
+                    {
                         Ok(status) => {
                             self.view = View::Status {
                                 worktree,
@@ -469,13 +567,19 @@ impl App {
                         }
                         Err(error) => self.message = Some(format!("{error:#}")),
                     }
+                } else {
+                    self.message = Some("select a worktree, not a repository".to_owned());
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(worktree) = self.selected_worktree().cloned() {
-                    match self.repository.assess_deletion(&worktree.key) {
+                if let Some((repository_index, worktree)) = self.selected_worktree() {
+                    match self.repositories[repository_index]
+                        .repository
+                        .assess_deletion(&worktree.key)
+                    {
                         Ok(assessment) => {
                             self.view = View::ConfirmDelete {
+                                repository_index,
                                 worktree,
                                 assessment,
                                 phase: ConfirmationPhase::Initial,
@@ -484,6 +588,8 @@ impl App {
                         }
                         Err(error) => self.message = Some(format!("{error:#}")),
                     }
+                } else {
+                    self.message = Some("select a worktree, not a repository".to_owned());
                 }
             }
             _ => {}
@@ -496,11 +602,18 @@ impl App {
             self.view = View::Worktrees;
             return Ok(false);
         }
-        let worktree = match &self.view {
-            View::ConfirmDelete { worktree, .. } => worktree.clone(),
+        let (repository_index, worktree) = match &self.view {
+            View::ConfirmDelete {
+                repository_index,
+                worktree,
+                ..
+            } => (*repository_index, worktree.clone()),
             _ => return Ok(false),
         };
-        match self.repository.delete_worktree(&worktree.key, false) {
+        match self.repositories[repository_index]
+            .repository
+            .delete_worktree(&worktree.key, false)
+        {
             Ok(DeleteResult::Deleted) => {
                 self.message = None;
                 self.view = View::Worktrees;
@@ -508,6 +621,7 @@ impl App {
             }
             Ok(DeleteResult::NeedsForce(assessment)) => {
                 self.view = View::ConfirmDelete {
+                    repository_index,
                     worktree,
                     assessment,
                     phase: ConfirmationPhase::Force,
@@ -528,11 +642,18 @@ impl App {
             self.view = View::Worktrees;
             return Ok(false);
         }
-        let worktree = match &self.view {
-            View::ConfirmDelete { worktree, .. } => worktree.clone(),
+        let (repository_index, worktree) = match &self.view {
+            View::ConfirmDelete {
+                repository_index,
+                worktree,
+                ..
+            } => (*repository_index, worktree.clone()),
             _ => return Ok(false),
         };
-        match self.repository.delete_worktree(&worktree.key, true) {
+        match self.repositories[repository_index]
+            .repository
+            .delete_worktree(&worktree.key, true)
+        {
             Ok(DeleteResult::Deleted) => {
                 self.message = None;
                 self.view = View::Worktrees;
@@ -552,8 +673,79 @@ impl App {
         Ok(false)
     }
 
-    fn selected_worktree(&self) -> Option<&WorktreeInfo> {
-        self.worktrees.get(self.selected)
+    fn row_count(&self) -> usize {
+        self.repositories
+            .iter()
+            .filter(|group| self.group_is_visible(group))
+            .map(|group| group.worktrees.len().saturating_add(1))
+            .sum()
+    }
+
+    fn selected_worktree(&self) -> Option<(usize, WorktreeInfo)> {
+        let mut row = 0;
+        for (repository_index, group) in self.repositories.iter().enumerate() {
+            if !self.group_is_visible(group) {
+                continue;
+            }
+            if self.selected == row {
+                return None;
+            }
+            row += 1;
+            if self.selected < row + group.worktrees.len() {
+                return Some((
+                    repository_index,
+                    group.worktrees[self.selected - row].clone(),
+                ));
+            }
+            row += group.worktrees.len();
+        }
+        None
+    }
+
+    fn selected_identity(&self) -> Option<TreeIdentity> {
+        let mut row = 0;
+        for group in self
+            .repositories
+            .iter()
+            .filter(|group| self.group_is_visible(group))
+        {
+            if self.selected == row {
+                return Some(TreeIdentity::Repository(
+                    group.repository.root().to_path_buf(),
+                ));
+            }
+            row += 1;
+            if self.selected < row + group.worktrees.len() {
+                return Some(TreeIdentity::Worktree(
+                    group.repository.root().to_path_buf(),
+                    group.worktrees[self.selected - row].key.clone(),
+                ));
+            }
+            row += group.worktrees.len();
+        }
+        None
+    }
+
+    fn row_for_identity(&self, identity: &TreeIdentity) -> Option<usize> {
+        let mut row = 0;
+        for group in self
+            .repositories
+            .iter()
+            .filter(|group| self.group_is_visible(group))
+        {
+            let root = group.repository.root();
+            if identity == &TreeIdentity::Repository(root.to_path_buf()) {
+                return Some(row);
+            }
+            row += 1;
+            for worktree in &group.worktrees {
+                if identity == &TreeIdentity::Worktree(root.to_path_buf(), worktree.key.clone()) {
+                    return Some(row);
+                }
+                row += 1;
+            }
+        }
+        None
     }
 
     fn refresh(&mut self) {
@@ -562,30 +754,50 @@ impl App {
     }
 
     fn refresh_preserving_message(&mut self) {
-        let selected_key = self
-            .selected_worktree()
-            .map(|worktree| worktree.key.clone());
-        match self.repository.list_worktrees() {
-            Ok(worktrees) => {
-                self.worktrees = worktrees;
-                self.selected = selected_key
-                    .and_then(|key| {
-                        self.worktrees
-                            .iter()
-                            .position(|worktree| worktree.key == key)
-                    })
-                    .unwrap_or_else(|| self.selected.min(self.worktrees.len().saturating_sub(1)));
+        let selected_identity = self.selected_identity();
+        for group in &mut self.repositories {
+            match group.repository.list_worktrees() {
+                Ok(worktrees) => group.worktrees = worktrees,
+                Err(error) => {
+                    self.message = Some(format!("{error:#}"));
+                    return;
+                }
             }
-            Err(error) => self.message = Some(format!("{error:#}")),
         }
+        self.selected = selected_identity
+            .as_ref()
+            .and_then(|identity| self.row_for_identity(identity))
+            .unwrap_or_else(|| self.selected.min(self.row_count().saturating_sub(1)));
+    }
+
+    fn group_is_visible(&self, group: &RepositoryGroup) -> bool {
+        !self.recursive
+            || !self.hide_without_linked
+            || group
+                .worktrees
+                .iter()
+                .any(|worktree| matches!(worktree.key, WorktreeKey::Linked(_)))
+    }
+
+    fn toggle_hide_without_linked(&mut self) {
+        let selected_identity = self.selected_identity();
+        self.hide_without_linked = !self.hide_without_linked;
+        self.selected = selected_identity
+            .as_ref()
+            .and_then(|identity| self.row_for_identity(identity))
+            .unwrap_or_else(|| usize::from(self.row_count() > 1));
     }
 }
 
-fn handle_scroll_key(key: KeyEvent, offset: &mut usize, len: usize) {
+fn handle_scroll_key(key: KeyEvent, offset: &mut usize, len: usize, page_size: usize) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => *offset = offset.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
             *offset = offset.saturating_add(1).min(len.saturating_sub(1));
+        }
+        KeyCode::PageUp => *offset = offset.saturating_sub(page_size),
+        KeyCode::PageDown => {
+            *offset = offset.saturating_add(page_size).min(len.saturating_sub(1));
         }
         KeyCode::Home => *offset = 0,
         KeyCode::End => *offset = len.saturating_sub(1),
@@ -630,7 +842,7 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
 
 fn render_detail_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k scroll   Esc/q back")
+        Paragraph::new("↑/↓ or j/k scroll   PgUp/PgDn page   Esc/q back")
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray)),
         area,
@@ -640,6 +852,15 @@ fn render_detail_help(frame: &mut Frame<'_>, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn repository_manager() -> (TempDir, RepositoryManager) {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        gix::init(directory.path()).expect("repository should initialize");
+        let repository =
+            RepositoryManager::discover(directory.path()).expect("repository should be discovered");
+        (directory, repository)
+    }
 
     #[test]
     fn scroll_stays_within_content() {
@@ -648,20 +869,42 @@ mod tests {
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &mut offset,
             2,
+            10,
         );
         assert_eq!(offset, 1);
         handle_scroll_key(
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &mut offset,
             2,
+            10,
         );
         assert_eq!(offset, 1);
         handle_scroll_key(
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &mut offset,
             2,
+            10,
         );
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn page_scroll_moves_by_the_visible_page_size() {
+        let mut offset = 2;
+        handle_scroll_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut offset,
+            20,
+            5,
+        );
+        assert_eq!(offset, 7);
+        handle_scroll_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut offset,
+            20,
+            5,
+        );
+        assert_eq!(offset, 2);
     }
 
     #[test]
@@ -672,5 +915,47 @@ mod tests {
             .as_secs() as i64;
         assert_eq!(relative_age(now - 90), "1m ago");
         assert_eq!(relative_age(now - 7_200), "2h ago");
+    }
+
+    #[test]
+    fn repository_and_worktree_are_separate_tree_rows() {
+        let (_directory, repository) = repository_manager();
+        let app = App::new(vec![repository], false).expect("application should initialize");
+
+        assert_eq!(app.row_count(), 2);
+        assert_eq!(app.selected, 1);
+        assert!(app.selected_worktree().is_some());
+        assert!(matches!(
+            app.selected_identity(),
+            Some(TreeIdentity::Worktree(_, WorktreeKey::Main))
+        ));
+    }
+
+    #[test]
+    fn recursive_filter_keeps_only_repositories_with_linked_worktrees() {
+        let (_first_directory, first_repository) = repository_manager();
+        let (_second_directory, second_repository) = repository_manager();
+        let mut app = App::new(vec![first_repository, second_repository], true)
+            .expect("application should initialize");
+        app.repositories[1].worktrees.push(WorktreeInfo {
+            key: WorktreeKey::Linked("feature".to_owned()),
+            path: std::path::PathBuf::from("feature"),
+            head: None,
+            committed_at: None,
+            branch: Some("feature".to_owned()),
+            locked: false,
+            available: true,
+        });
+
+        assert_eq!(app.row_count(), 5);
+        app.toggle_hide_without_linked();
+
+        assert!(app.hide_without_linked);
+        assert_eq!(app.row_count(), 3);
+        assert_eq!(app.selected, 1);
+        assert!(matches!(
+            app.selected_identity(),
+            Some(TreeIdentity::Worktree(_, WorktreeKey::Main))
+        ));
     }
 }

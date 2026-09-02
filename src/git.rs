@@ -113,10 +113,11 @@ pub enum DeleteResult {
     NeedsForce(DeletionAssessment),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RepositoryManager {
     main_git_dir: PathBuf,
     common_dir: PathBuf,
+    root: PathBuf,
 }
 
 impl RepositoryManager {
@@ -127,6 +128,10 @@ impl RepositoryManager {
                 path.display()
             )
         })?;
+        Self::from_repository(repository)
+    }
+
+    fn from_repository(repository: gix::Repository) -> Result<Self> {
         let main = repository
             .main_repo()
             .context("failed to open the main repository")?;
@@ -134,10 +139,22 @@ impl RepositoryManager {
             .with_context(|| format!("failed to validate {}", main.git_dir().display()))?;
         let common_dir = fs::canonicalize(main.common_dir())
             .with_context(|| format!("failed to validate {}", main.common_dir().display()))?;
+        let root = main.worktree().map_or_else(
+            || Ok::<_, anyhow::Error>(common_dir.clone()),
+            |worktree| {
+                fs::canonicalize(worktree.base())
+                    .with_context(|| format!("failed to validate {}", worktree.base().display()))
+            },
+        )?;
         Ok(Self {
             main_git_dir,
             common_dir,
+            root,
         })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>> {
@@ -374,6 +391,82 @@ impl RepositoryManager {
             bail!("the worktree containing the current directory cannot be deleted");
         }
         Ok(())
+    }
+}
+
+pub fn discover_repositories(path: &Path, recursive: bool) -> Result<Vec<RepositoryManager>> {
+    if !recursive {
+        return Ok(vec![RepositoryManager::discover(path)?]);
+    }
+
+    let search_root = fs::canonicalize(path)
+        .with_context(|| format!("failed to access search directory {}", path.display()))?;
+    if !search_root.is_dir() {
+        bail!("search path {} is not a directory", search_root.display());
+    }
+
+    let mut repositories = Vec::new();
+    match gix::discover(&search_root) {
+        Ok(repository) => push_unique_repository(
+            &mut repositories,
+            RepositoryManager::from_repository(repository)?,
+        ),
+        Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
+            ..
+        })) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to discover a Git repository from {}",
+                    search_root.display()
+                )
+            });
+        }
+    }
+
+    let mut children = fs::read_dir(&search_root)
+        .with_context(|| format!("failed to read {}", search_root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read entries in {}", search_root.display()))?;
+    children.sort_by_key(std::fs::DirEntry::path);
+
+    for child in children {
+        if !child
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", child.path().display()))?
+            .is_dir()
+            || !child.path().join(".git").exists()
+        {
+            continue;
+        }
+        let Ok(repository) = gix::open(child.path()) else {
+            continue;
+        };
+        push_unique_repository(
+            &mut repositories,
+            RepositoryManager::from_repository(repository)?,
+        );
+    }
+
+    if repositories.is_empty() {
+        bail!(
+            "no Git repositories found in {} or its immediate children",
+            search_root.display()
+        );
+    }
+    repositories.sort_by(|left, right| left.root.cmp(&right.root));
+    Ok(repositories)
+}
+
+fn push_unique_repository(
+    repositories: &mut Vec<RepositoryManager>,
+    repository: RepositoryManager,
+) {
+    if !repositories
+        .iter()
+        .any(|existing| existing.common_dir == repository.common_dir)
+    {
+        repositories.push(repository);
     }
 }
 
@@ -674,5 +767,62 @@ mod tests {
 
         assert_eq!(result, DeleteResult::Deleted);
         assert!(!directory.path().join(".git/worktrees/linked").exists());
+    }
+
+    #[test]
+    fn recursive_discovery_finds_only_immediate_child_repositories() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let alpha = directory.path().join("alpha");
+        let beta = directory.path().join("beta");
+        let broken = directory.path().join("broken/.git");
+        let nested = directory.path().join("plain/nested");
+        fs::create_dir_all(&broken).expect("broken metadata should be created");
+        fs::create_dir_all(&nested).expect("nested directory should be created");
+        gix::init(&alpha).expect("alpha repository should initialize");
+        gix::init(&beta).expect("beta repository should initialize");
+        gix::init(&nested).expect("nested repository should initialize");
+
+        let repositories = discover_repositories(directory.path(), true)
+            .expect("repositories should be discovered");
+        let roots = repositories
+            .iter()
+            .map(|repository| repository.root().to_path_buf())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            roots,
+            vec![
+                fs::canonicalize(alpha).expect("alpha path should canonicalize"),
+                fs::canonicalize(beta).expect("beta path should canonicalize"),
+            ]
+        );
+        assert!(
+            !roots.contains(&fs::canonicalize(nested).expect("nested path should canonicalize"))
+        );
+    }
+
+    #[test]
+    fn recursive_discovery_deduplicates_linked_checkouts() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let main = directory.path().join("main");
+        let linked = directory.path().join("linked");
+        gix::init(&main).expect("main repository should initialize");
+        add_linked_fixture(&main, "linked", &linked);
+
+        let repositories = discover_repositories(directory.path(), true)
+            .expect("repositories should be discovered");
+
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(
+            repositories[0].root(),
+            fs::canonicalize(main).expect("main path should canonicalize")
+        );
+        assert_eq!(
+            repositories[0]
+                .list_worktrees()
+                .expect("worktrees should be listed")
+                .len(),
+            2
+        );
     }
 }

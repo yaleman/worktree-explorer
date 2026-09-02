@@ -5,7 +5,8 @@ worktrees attached to a repository.
 
 It shows each worktree's current commit, the age of that commit, branch, and
 location. From the list you can inspect commit history, review local changes,
-or remove a worktree.
+or remove a worktree. Repositories and their worktrees are displayed as a
+tree.
 
 ## Build
 
@@ -31,11 +32,21 @@ If you have installed or copied the executable somewhere on your PATH, use:
 
 **DIRECTORY** defaults to the current directory.
 
+To scan **DIRECTORY** and its immediate child directories for repositories,
+use:
+
+    worktree-explorer --recursive [DIRECTORY]
+
+The recursive scan is limited to one level. Repositories discovered through
+more than one checkout are shown only once.
+
 ## Controls
 
 | Key | Action |
 | --- | --- |
 | ↑ / ↓ or j / k | Move or scroll |
+| Page Up / Page Down | Move or scroll one page |
+| h (recursive mode) | Hide or show repositories without linked worktrees |
 | l | Show the selected worktree's latest commits |
 | s | Show staged, unstaged, conflicted, and untracked changes |
 | d | Delete the selected linked worktree |
