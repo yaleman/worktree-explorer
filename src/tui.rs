@@ -34,6 +34,9 @@ pub fn run(repositories: Vec<RepositoryManager>, recursive: bool) -> Result<()> 
         terminal
             .draw(|frame| app.render(frame))
             .context("failed to draw the interface")?;
+        if app.process_pending_deletion() {
+            continue;
+        }
         if let Event::Key(key) = event::read().context("failed to read terminal input")?
             && app.handle_key(key)?
         {
@@ -68,6 +71,18 @@ enum ConfirmationPhase {
     Force,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeletionMode {
+    Normal,
+    Force,
+}
+
+impl DeletionMode {
+    fn force(self) -> bool {
+        matches!(self, Self::Force)
+    }
+}
+
 #[derive(Debug)]
 enum View {
     Worktrees,
@@ -87,6 +102,11 @@ enum View {
         assessment: DeletionAssessment,
         phase: ConfirmationPhase,
         offset: usize,
+    },
+    Deleting {
+        repository_index: usize,
+        worktree: WorktreeInfo,
+        mode: DeletionMode,
     },
 }
 
@@ -161,6 +181,14 @@ impl App {
             } => {
                 self.render_worktrees(frame, area);
                 self.render_confirmation(frame, area, worktree, assessment, *phase, *offset);
+            }
+            View::Deleting {
+                repository_index: _,
+                worktree,
+                mode: _,
+            } => {
+                self.render_worktrees(frame, area);
+                self.render_deleting(frame, area, worktree);
             }
         }
     }
@@ -456,6 +484,27 @@ impl App {
         frame.render_widget(paragraph, popup);
     }
 
+    fn render_deleting(&self, frame: &mut Frame<'_>, area: Rect, worktree: &WorktreeInfo) {
+        let popup = centered_rect(76, 5, area);
+        frame.render_widget(ClearWidget, popup);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(worktree.path.display().to_string()),
+                Line::from(Span::styled(
+                    "Deleting...",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Delete worktree "),
+            ),
+            popup,
+        );
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
@@ -507,6 +556,7 @@ impl App {
                     ConfirmationPhase::Force => self.handle_force_confirmation(key),
                 }
             }
+            View::Deleting { .. } => Ok(false),
         }
     }
 
@@ -610,30 +660,11 @@ impl App {
             } => (*repository_index, worktree.clone()),
             _ => return Ok(false),
         };
-        match self.repositories[repository_index]
-            .repository
-            .delete_worktree(&worktree.key, false)
-        {
-            Ok(DeleteResult::Deleted) => {
-                self.message = None;
-                self.view = View::Worktrees;
-                self.refresh();
-            }
-            Ok(DeleteResult::NeedsForce(assessment)) => {
-                self.view = View::ConfirmDelete {
-                    repository_index,
-                    worktree,
-                    assessment,
-                    phase: ConfirmationPhase::Force,
-                    offset: 0,
-                };
-            }
-            Err(error) => {
-                self.message = Some(format!("{error:#}"));
-                self.view = View::Worktrees;
-                self.refresh_preserving_message();
-            }
-        }
+        self.view = View::Deleting {
+            repository_index,
+            worktree,
+            mode: DeletionMode::Normal,
+        };
         Ok(false)
     }
 
@@ -650,27 +681,55 @@ impl App {
             } => (*repository_index, worktree.clone()),
             _ => return Ok(false),
         };
+        self.view = View::Deleting {
+            repository_index,
+            worktree,
+            mode: DeletionMode::Force,
+        };
+        Ok(false)
+    }
+
+    fn process_pending_deletion(&mut self) -> bool {
+        let (repository_index, worktree, mode) = match &self.view {
+            View::Deleting {
+                repository_index,
+                worktree,
+                mode,
+            } => (*repository_index, worktree.clone(), *mode),
+            _ => return false,
+        };
         match self.repositories[repository_index]
             .repository
-            .delete_worktree(&worktree.key, true)
+            .delete_worktree(&worktree.key, mode.force())
         {
             Ok(DeleteResult::Deleted) => {
                 self.message = None;
                 self.view = View::Worktrees;
                 self.refresh();
             }
-            Ok(DeleteResult::NeedsForce(_)) => {
-                self.message =
-                    Some("worktree state changed; deletion was not performed".to_owned());
-                self.view = View::Worktrees;
-            }
+            Ok(DeleteResult::NeedsForce(assessment)) => match mode {
+                DeletionMode::Normal => {
+                    self.view = View::ConfirmDelete {
+                        repository_index,
+                        worktree,
+                        assessment,
+                        phase: ConfirmationPhase::Force,
+                        offset: 0,
+                    };
+                }
+                DeletionMode::Force => {
+                    self.message =
+                        Some("worktree state changed; deletion was not performed".to_owned());
+                    self.view = View::Worktrees;
+                }
+            },
             Err(error) => {
                 self.message = Some(format!("{error:#}"));
                 self.view = View::Worktrees;
                 self.refresh_preserving_message();
             }
         }
-        Ok(false)
+        true
     }
 
     fn row_count(&self) -> usize {
@@ -852,6 +911,7 @@ fn render_detail_help(frame: &mut Frame<'_>, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
     use tempfile::TempDir;
 
     fn repository_manager() -> (TempDir, RepositoryManager) {
@@ -956,6 +1016,79 @@ mod tests {
         assert!(matches!(
             app.selected_identity(),
             Some(TreeIdentity::Worktree(_, WorktreeKey::Main))
+        ));
+    }
+
+    #[test]
+    fn confirmed_deletion_renders_progress_before_processing() {
+        let (_directory, repository) = repository_manager();
+        let mut app = App::new(vec![repository], false).expect("application should initialize");
+        let worktree = app.repositories[0].worktrees[0].clone();
+        app.view = View::ConfirmDelete {
+            repository_index: 0,
+            worktree: worktree.clone(),
+            assessment: DeletionAssessment {
+                changes: Vec::new(),
+                locked: false,
+                missing: false,
+            },
+            phase: ConfirmationPhase::Initial,
+            offset: 0,
+        };
+
+        app.handle_initial_confirmation(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("confirmation should be handled");
+        assert!(matches!(
+            app.view,
+            View::Deleting {
+                mode: DeletionMode::Normal,
+                ..
+            }
+        ));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("deletion progress should render");
+        let contents = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(contents.contains("Deleting..."));
+        assert!(!contents.contains("Delete this worktree?"));
+    }
+
+    #[test]
+    fn force_confirmation_enters_force_deletion_progress() {
+        let (_directory, repository) = repository_manager();
+        let mut app = App::new(vec![repository], false).expect("application should initialize");
+        let worktree = app.repositories[0].worktrees[0].clone();
+        app.view = View::ConfirmDelete {
+            repository_index: 0,
+            worktree,
+            assessment: DeletionAssessment {
+                changes: Vec::new(),
+                locked: true,
+                missing: false,
+            },
+            phase: ConfirmationPhase::Force,
+            offset: 0,
+        };
+
+        app.handle_force_confirmation(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT))
+            .expect("force confirmation should be handled");
+
+        assert!(matches!(
+            app.view,
+            View::Deleting {
+                mode: DeletionMode::Force,
+                ..
+            }
         ));
     }
 }
