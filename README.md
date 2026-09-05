@@ -1,7 +1,7 @@
 # Worktree Explorer
 
 Worktree Explorer is a terminal interface for viewing and managing the Git
-worktrees attached to a repository.
+worktrees and local branches attached to a repository.
 
 It shows each worktree's current commit, the age of that commit, branch, and
 location. From the list you can inspect commit history, review local changes,
@@ -40,6 +40,12 @@ use:
 The recursive scan is limited to one level. Repositories discovered through
 more than one checkout are shown only once.
 
+To manage local branches instead of worktrees, use:
+
+    worktree-explorer --branches [DIRECTORY]
+
+Branch mode can also be combined with `--recursive`.
+
 ## Controls
 
 | Key | Action |
@@ -47,9 +53,9 @@ more than one checkout are shown only once.
 | ↑ / ↓ or j / k | Move or scroll |
 | Page Up / Page Down | Move or scroll one page |
 | h (recursive mode) | Hide or show repositories without linked worktrees |
-| l | Show the selected worktree's latest commits |
-| s | Show staged, unstaged, conflicted, and untracked changes |
-| d | Delete the selected linked worktree |
+| l | Show the selected worktree or branch's latest commits |
+| s | Show status and upstream information |
+| d | Delete the selected linked worktree or local branch |
 | r | Refresh the worktree list |
 | Esc or q | Return to the worktree list |
 | q from the worktree list | Quit |
@@ -66,6 +72,16 @@ the affected paths and requires a second force confirmation with uppercase
 The main worktree cannot be deleted. Worktree Explorer also refuses to delete
 the worktree containing its current working directory. Removing a worktree
 does not delete its Git branch.
+
+## Branch mode
+
+Branch mode lists local branches with their latest commit and any worktree
+where they are checked out. `l` shows branch history. `s` shows the configured
+upstream and ahead/behind counts; checked-out branches also show nonzero
+working-tree change counts. `d` deletes a local branch after confirmation.
+Checked-out branches cannot be deleted, and unmerged branches require the
+uppercase **D** force confirmation. Remote-tracking branches are never
+modified.
 
 ## Terminal cleanup
 

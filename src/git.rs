@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -6,6 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use gix::{
     bstr::ByteSlice,
+    remote::Direction,
     status::{Item as GixStatusItem, index_worktree::iter::Summary},
 };
 
@@ -26,6 +28,53 @@ pub struct WorktreeInfo {
     pub branch: Option<String>,
     pub locked: bool,
     pub available: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub head: String,
+    pub committed_at: i64,
+    pub checked_out_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChangeCounts {
+    pub staged: usize,
+    pub unstaged: usize,
+    pub untracked: usize,
+    pub deleted: usize,
+    pub conflicted: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamState {
+    NotConfigured,
+    Missing,
+    Present,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchStatus {
+    pub branch: String,
+    pub upstream: Option<String>,
+    pub upstream_state: UpstreamState,
+    pub ahead: usize,
+    pub behind: usize,
+    pub checked_out_paths: Vec<PathBuf>,
+    pub changes: ChangeCounts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchDeletionAssessment {
+    pub checked_out_paths: Vec<PathBuf>,
+    pub unmerged: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchDeleteResult {
+    Deleted,
+    NeedsForce(BranchDeletionAssessment),
 }
 
 impl WorktreeInfo {
@@ -202,6 +251,165 @@ impl RepositoryManager {
         Ok(worktrees)
     }
 
+    pub fn list_branches(&self) -> Result<Vec<BranchInfo>> {
+        let main = self.open_main()?;
+        let checked_out = self
+            .list_worktrees()?
+            .into_iter()
+            .filter_map(|worktree| worktree.branch.map(|branch| (branch, worktree.path)))
+            .fold(
+                HashMap::<String, Vec<PathBuf>>::new(),
+                |mut paths, (branch, path)| {
+                    paths.entry(branch).or_default().push(path);
+                    paths
+                },
+            );
+        let reference_platform = main
+            .references()
+            .context("failed to access repository references")?;
+        let references = reference_platform
+            .local_branches()
+            .context("failed to enumerate local branches")?
+            .peeled()
+            .context("failed to prepare local branch references")?;
+        let mut branches = Vec::new();
+        for reference in references {
+            let reference = reference
+                .map_err(|error| anyhow!("failed to read a local branch reference: {error}"))?;
+            let name = reference.name().shorten().to_string();
+            let id = reference
+                .try_id()
+                .ok_or_else(|| anyhow!("local branch {name} does not point to an object"))?;
+            let (head, committed_at) = commit_details(&id)?;
+            branches.push(BranchInfo {
+                name: name.clone(),
+                head,
+                committed_at,
+                checked_out_paths: checked_out.get(&name).cloned().unwrap_or_default(),
+            });
+        }
+        branches.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(branches)
+    }
+
+    pub fn branch_status(&self, name: &str) -> Result<BranchStatus> {
+        let main = self.open_main()?;
+        let full_name: gix::refs::FullName = format!("refs/heads/{name}")
+            .try_into()
+            .with_context(|| format!("invalid local branch name {name}"))?;
+        let mut reference = main
+            .find_reference(&full_name)
+            .with_context(|| format!("failed to find local branch {name}"))?;
+        let branch_id = reference
+            .peel_to_id()
+            .with_context(|| format!("failed to resolve local branch {name}"))?;
+        let checked_out_paths = self
+            .list_branches()?
+            .into_iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.checked_out_paths)
+            .unwrap_or_default();
+        let (upstream, upstream_state, ahead, behind) = match reference
+            .remote_tracking_ref_name(Direction::Fetch)
+            .transpose()
+            .context("failed to resolve the branch upstream")?
+        {
+            Some(upstream_name) => {
+                let upstream_label = upstream_name.shorten().to_string();
+                match main.try_find_reference(upstream_name.as_ref())? {
+                    Some(mut upstream_ref) => {
+                        let upstream_id = upstream_ref
+                            .peel_to_id()
+                            .context("failed to resolve the branch upstream commit")?;
+                        let branch_commits = reachable_commits(&branch_id)?;
+                        let upstream_commits = reachable_commits(&upstream_id)?;
+                        let ahead = branch_commits.difference(&upstream_commits).count();
+                        let behind = upstream_commits.difference(&branch_commits).count();
+                        (Some(upstream_label), UpstreamState::Present, ahead, behind)
+                    }
+                    None => (Some(upstream_label), UpstreamState::Missing, 0, 0),
+                }
+            }
+            None => (None, UpstreamState::NotConfigured, 0, 0),
+        };
+        let mut changes = ChangeCounts::default();
+        for worktree in self
+            .list_worktrees()?
+            .into_iter()
+            .filter(|worktree| worktree.branch.as_deref() == Some(name) && worktree.available)
+        {
+            for entry in self.status(&worktree.key)?.entries {
+                match (entry.area, entry.kind) {
+                    (StatusArea::Index, ChangeKind::Deleted)
+                    | (StatusArea::Worktree, ChangeKind::Deleted) => changes.deleted += 1,
+                    (StatusArea::Index, ChangeKind::Conflict)
+                    | (StatusArea::Worktree, ChangeKind::Conflict) => changes.conflicted += 1,
+                    (StatusArea::Index, _) => changes.staged += 1,
+                    (StatusArea::Worktree, ChangeKind::Added) => changes.untracked += 1,
+                    (StatusArea::Worktree, _) => changes.unstaged += 1,
+                }
+            }
+        }
+        Ok(BranchStatus {
+            branch: name.to_owned(),
+            upstream,
+            upstream_state,
+            ahead,
+            behind,
+            checked_out_paths,
+            changes,
+        })
+    }
+
+    pub fn assess_branch_deletion(&self, name: &str) -> Result<BranchDeletionAssessment> {
+        let main = self.open_main()?;
+        let full_name: gix::refs::FullName = format!("refs/heads/{name}")
+            .try_into()
+            .with_context(|| format!("invalid local branch name {name}"))?;
+        let mut reference = main
+            .find_reference(&full_name)
+            .with_context(|| format!("failed to find local branch {name}"))?;
+        let branch_id = reference
+            .peel_to_id()
+            .with_context(|| format!("failed to resolve local branch {name}"))?;
+        let checked_out_paths = self
+            .list_branches()?
+            .into_iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.checked_out_paths)
+            .unwrap_or_default();
+        let unmerged = main
+            .head_id()
+            .ok()
+            .map(|head| {
+                let branch_id = branch_id.detach();
+                reachable_commits(&head).map(|commits| !commits.contains(&branch_id))
+            })
+            .transpose()?
+            .unwrap_or(true);
+        Ok(BranchDeletionAssessment {
+            checked_out_paths,
+            unmerged,
+        })
+    }
+
+    pub fn delete_branch(&self, name: &str, force: bool) -> Result<BranchDeleteResult> {
+        let assessment = self.assess_branch_deletion(name)?;
+        if !assessment.checked_out_paths.is_empty() {
+            bail!("branch {name} is checked out in a worktree");
+        }
+        if assessment.unmerged && !force {
+            return Ok(BranchDeleteResult::NeedsForce(assessment));
+        }
+        let full_name: gix::refs::FullName = format!("refs/heads/{name}")
+            .try_into()
+            .with_context(|| format!("invalid local branch name {name}"))?;
+        let mut main = self.open_main()?;
+        main.delete_local_branches([full_name])
+            .with_context(|| format!("failed to delete local branch {name}"))?;
+        Ok(BranchDeleteResult::Deleted)
+    }
+
     pub fn status(&self, key: &WorktreeKey) -> Result<WorktreeStatus> {
         let info = self.find_worktree(key)?;
         if !info.available {
@@ -241,36 +449,21 @@ impl RepositoryManager {
             )) => return Ok(Vec::new()),
             Err(error) => return Err(error).context("failed to resolve worktree HEAD"),
         };
-        let walk = head
-            .ancestors()
-            .sorting(gix::revision::walk::Sorting::ByCommitTime(
-                gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
-            ))
-            .all()
-            .context("failed to traverse commit history")?;
-        let mut entries = Vec::new();
-        for info in walk.take(LOG_LIMIT) {
-            let info = info.context("failed while traversing commit history")?;
-            let commit = info.object().context("failed to read commit")?;
-            let decoded = commit.decode().context("failed to decode commit")?;
-            let subject = decoded.message().title.to_str_lossy().trim().to_owned();
-            let author = decoded
-                .author()
-                .context("failed to decode commit author")?
-                .name
-                .to_str_lossy()
-                .into_owned();
-            entries.push(LogEntry {
-                id: abbreviate_id(&info.id.to_string()),
-                subject,
-                author,
-                committed_at: decoded
-                    .time()
-                    .context("failed to decode commit time")?
-                    .seconds,
-            });
-        }
-        Ok(entries)
+        log_from_id(&head)
+    }
+
+    pub fn log_branch(&self, name: &str) -> Result<Vec<LogEntry>> {
+        let repository = self.open_main()?;
+        let full_name: gix::refs::FullName = format!("refs/heads/{name}")
+            .try_into()
+            .with_context(|| format!("invalid local branch name {name}"))?;
+        let mut reference = repository
+            .find_reference(&full_name)
+            .with_context(|| format!("failed to find local branch {name}"))?;
+        let head = reference
+            .peel_to_id()
+            .with_context(|| format!("failed to resolve local branch {name}"))?;
+        log_from_id(&head)
     }
 
     pub fn assess_deletion(&self, key: &WorktreeKey) -> Result<DeletionAssessment> {
@@ -394,6 +587,39 @@ impl RepositoryManager {
     }
 }
 
+fn log_from_id(id: &gix::Id<'_>) -> Result<Vec<LogEntry>> {
+    let walk = id
+        .ancestors()
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
+        .all()
+        .context("failed to traverse commit history")?;
+    let mut entries = Vec::new();
+    for info in walk.take(LOG_LIMIT) {
+        let info = info.context("failed while traversing commit history")?;
+        let commit = info.object().context("failed to read commit")?;
+        let decoded = commit.decode().context("failed to decode commit")?;
+        let subject = decoded.message().title.to_str_lossy().trim().to_owned();
+        let author = decoded
+            .author()
+            .context("failed to decode commit author")?
+            .name
+            .to_str_lossy()
+            .into_owned();
+        entries.push(LogEntry {
+            id: abbreviate_id(&info.id.to_string()),
+            subject,
+            author,
+            committed_at: decoded
+                .time()
+                .context("failed to decode commit time")?
+                .seconds,
+        });
+    }
+    Ok(entries)
+}
+
 pub fn discover_repositories(path: &Path, recursive: bool) -> Result<Vec<RepositoryManager>> {
     if !recursive {
         return Ok(vec![RepositoryManager::discover(path)?]);
@@ -485,6 +711,31 @@ fn head_details(repository: &gix::Repository) -> (Option<String>, Option<i64>, O
         .flatten()
         .map(|name| name.shorten().to_string());
     (head, committed_at, branch)
+}
+
+fn commit_details(id: &gix::Id<'_>) -> Result<(String, i64)> {
+    let commit = id
+        .object()
+        .context("failed to read branch tip")?
+        .try_into_commit()
+        .map_err(|_| anyhow!("branch tip is not a commit"))?;
+    let committed_at = commit
+        .time()
+        .context("failed to read branch commit time")?
+        .seconds;
+    Ok((abbreviate_id(&id.to_string()), committed_at))
+}
+
+fn reachable_commits(id: &gix::Id<'_>) -> Result<HashSet<gix::ObjectId>> {
+    let mut commits = HashSet::new();
+    for info in id
+        .ancestors()
+        .all()
+        .context("failed to walk commit history")?
+    {
+        commits.insert(info.context("failed while walking commit history")?.id);
+    }
+    Ok(commits)
 }
 
 fn abbreviate_id(id: &str) -> String {
@@ -767,6 +1018,59 @@ mod tests {
 
         assert_eq!(result, DeleteResult::Deleted);
         assert!(!directory.path().join(".git/worktrees/linked").exists());
+    }
+
+    #[test]
+    fn lists_local_branches_and_reports_status() {
+        let (_directory, manager) = init_repository();
+        let repository = gix::open(manager.root()).expect("repository should open");
+        let signature = gix::actor::SignatureRef {
+            name: b"Test Author".as_bstr(),
+            email: b"test@example.invalid".as_bstr(),
+            time: "1700000000 +0000",
+        };
+        let tree = repository.empty_tree().id;
+        repository
+            .commit_as(
+                signature,
+                signature,
+                "HEAD",
+                "initial",
+                tree,
+                std::iter::empty::<gix::ObjectId>(),
+            )
+            .expect("initial commit should be created");
+
+        let branches = manager.list_branches().expect("branches should be listed");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].checked_out_paths.len(), 1);
+        assert_eq!(branches[0].head.len(), 8);
+
+        let status = manager
+            .branch_status(&branches[0].name)
+            .expect("branch status should be calculated");
+        assert_eq!(status.upstream_state, UpstreamState::NotConfigured);
+        assert_eq!(status.ahead, 0);
+        assert_eq!(status.behind, 0);
+
+        let head = repository
+            .head_id()
+            .expect("HEAD should resolve after initial commit")
+            .detach();
+        repository
+            .reference(
+                "refs/heads/topic",
+                head,
+                gix::refs::transaction::PreviousValue::MustNotExist,
+                "create topic",
+            )
+            .expect("topic branch should be created");
+        assert_eq!(
+            manager
+                .delete_branch("topic", false)
+                .expect("topic branch should be deleted"),
+            BranchDeleteResult::Deleted
+        );
     }
 
     #[test]
