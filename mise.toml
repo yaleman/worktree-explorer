@@ -1,0 +1,16 @@
+[tasks.fmt]
+description = "Run code formatters"
+run = "cargo fmt --quiet"
+
+[tasks.clippy]
+depends = ["fmt"]
+run = "cargo clippy --all --quiet"
+
+[tasks.test]
+depends = ["fmt"]
+description = "Run tests"
+run = "cargo test --quiet"
+
+[tasks.check]
+description = "Run all checks"
+depends = ["clippy", "test"]

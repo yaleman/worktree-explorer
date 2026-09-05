@@ -1014,7 +1014,7 @@ impl App {
                                 branch,
                                 ..
                             } => (*repository_index, branch.clone()),
-                            _ => unreachable!(),
+                            _ => return Err(anyhow::anyhow!("invalid state")),
                         };
                         self.view = View::DeletingBranch {
                             repository_index,
@@ -1029,7 +1029,7 @@ impl App {
                                 branch,
                                 ..
                             } => (*repository_index, branch.clone()),
-                            _ => unreachable!(),
+                            _ => return Err(anyhow::anyhow!("invalid state")),
                         };
                         self.view = View::DeletingBranch {
                             repository_index,

@@ -177,10 +177,10 @@ impl RepositoryManager {
                 path.display()
             )
         })?;
-        Self::from_repository(repository)
+        Self::from_repository(&repository)
     }
 
-    fn from_repository(repository: gix::Repository) -> Result<Self> {
+    fn from_repository(repository: &gix::Repository) -> Result<Self> {
         let main = repository
             .main_repo()
             .context("failed to open the main repository")?;
@@ -635,7 +635,7 @@ pub fn discover_repositories(path: &Path, recursive: bool) -> Result<Vec<Reposit
     match gix::discover(&search_root) {
         Ok(repository) => push_unique_repository(
             &mut repositories,
-            RepositoryManager::from_repository(repository)?,
+            RepositoryManager::from_repository(&repository)?,
         ),
         Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
             ..
@@ -670,7 +670,7 @@ pub fn discover_repositories(path: &Path, recursive: bool) -> Result<Vec<Reposit
         };
         push_unique_repository(
             &mut repositories,
-            RepositoryManager::from_repository(repository)?,
+            RepositoryManager::from_repository(&repository)?,
         );
     }
 
