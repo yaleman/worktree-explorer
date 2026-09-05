@@ -12,7 +12,9 @@ tree.
 
 You need a current Rust toolchain.
 
-    cargo build --release
+```shell
+cargo build --release
+```
 
 The executable will be written to **target/release/worktree-explorer**.
 
@@ -20,29 +22,39 @@ The executable will be written to **target/release/worktree-explorer**.
 
 Run it from anywhere inside a Git repository:
 
-    cargo run --release
+```shell
+cargo run --release
+```
 
 You can also point it at a repository or any directory inside one:
 
-    cargo run --release -- ../my-repository
+```shell
+cargo run --release -- ../my-repository
+```
 
 If you have installed or copied the executable somewhere on your PATH, use:
 
-    worktree-explorer [DIRECTORY]
+```shell
+worktree-explorer [DIRECTORY]
+```
 
 **DIRECTORY** defaults to the current directory.
 
 To scan **DIRECTORY** and its immediate child directories for repositories,
 use:
 
-    worktree-explorer --recursive [DIRECTORY]
+```shell
+worktree-explorer --recursive [DIRECTORY]
+```
 
 The recursive scan is limited to one level. Repositories discovered through
 more than one checkout are shown only once.
 
 To manage local branches instead of worktrees, use:
 
-    worktree-explorer --branches [DIRECTORY]
+```shell
+worktree-explorer --branches [DIRECTORY]
+```
 
 Branch mode can also be combined with `--recursive`.
 
@@ -82,9 +94,3 @@ working-tree change counts. `d` deletes a local branch after confirmation.
 Checked-out branches cannot be deleted, and unmerged branches require the
 uppercase **D** force confirmation. Remote-tracking branches are never
 modified.
-
-## Terminal cleanup
-
-Worktree Explorer clears the terminal when it starts and when it exits. It also
-restores normal input mode and makes the cursor visible again after quitting or
-encountering an error.
